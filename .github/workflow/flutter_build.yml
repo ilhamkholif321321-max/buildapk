@@ -21,10 +21,152 @@ on:
         required: false
         default: "false"
 
+# ==========================================================
+# 🔥 TAMBAHAN: PARALLEL BUILD
+# ==========================================================
+# Dengan matrix strategy, workflow bisa jalan 2x sekaligus
+# Tanpa mengubah cara kerja bot
+# ==========================================================
+
 jobs:
+  # ==========================================================
+  # JOB ANALYZE (TETAP SAMA KAYAK ASLI)
+  # ==========================================================
+  analyze:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.only_analyze == 'true' }}
+    timeout-minutes: 15
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Download ZIP project
+        run: |
+          echo "=== Downloading ZIP ==="
+          echo "URL: ${{ github.event.inputs.zip_url }}"
+
+          curl -L \
+            -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            "${{ github.event.inputs.zip_url }}" \
+            -o project.zip \
+            -w "\n=== HTTP Status: %{http_code} ===\n=== Final URL: %{url_effective} ===\n"
+
+          echo ""
+          echo "=== File Info ==="
+          ls -lh project.zip
+
+          echo ""
+          echo "=== File Type ==="
+          file project.zip
+
+          echo ""
+          echo "=== First Bytes ==="
+          xxd project.zip | head -2
+
+      - name: Extract ZIP
+        run: |
+          echo "=== Validating ZIP ==="
+
+          if ! unzip -t project.zip > /dev/null 2>&1; then
+            echo "❌ File bukan ZIP valid!"
+            echo ""
+            echo "=== Isi file ==="
+            cat project.zip
+            exit 1
+          fi
+
+          echo "✅ ZIP valid"
+
+          echo ""
+          echo "=== Extracting ZIP ==="
+          unzip -q project.zip -d project_raw
+
+          echo ""
+          echo "=== Isi folder project_raw ==="
+          find project_raw | head -50
+
+          echo ""
+          echo "=== Mengunci Project Dir (Manut Mode) ==="
+          
+          SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
+          FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
+          
+          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
+          else
+            PROJECT_DIR="project_raw"
+          fi
+
+          echo "✅ Project root langsung dikunci di: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@main
+        with:
+          flutter-version: "3.41.9"
+          channel: "stable"
+          cache: true
+
+      - name: Analyze Project Code
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          echo "=== Starting Automated Code Analysis ==="
+
+          if [ -f "pubspec.yaml" ]; then
+            echo "🔍 Menjalankan linting via flutter analyze..."
+
+            flutter analyze > analyze_report.txt 2>&1 || true
+
+            echo "[RESULT_ANALYZE]"
+            cat analyze_report.txt
+            echo "[END_RESULT_ANALYZE]"
+
+            rm -f analyze_report.txt
+
+          else
+            echo "☕ Project native / gradlew terdeteksi!"
+            echo "[RESULT_ANALYZE]"
+            echo "❌ Fitur analyze hanya support project Flutter (pubspec.yaml tidak ditemukan)."
+            echo "[END_RESULT_ANALYZE]"
+          fi
+
+      - name: Stop if Analyze Only
+        if: ${{ github.event.inputs.only_analyze == 'true' }}
+        run: |
+          echo "Analyze-only mode aktif. Workflow dihentikan di sini."
+          exit 1
+
+  # ==========================================================
+  # 🔥 JOB BUILD (DITAMBAHIN PARALEL)
+  # ==========================================================
   build:
+    if: ${{ github.event.inputs.only_analyze != 'true' }}
+    
+    # 🔥 INI TAMBAHANNYA: Matrix Strategy untuk Parallel Build
+    strategy:
+      matrix:
+        runner_id: [1, 2]        # 2 runner paralel
+      max-parallel: 2            # Maks 2 sekaligus
+      fail-fast: false           # Satu gagal, yang lain tetap jalan
+    
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    
+    # Nama job jadi beda biar gak bingung
+    name: "Build #${{ matrix.runner_id }}"
+    
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     
@@ -124,52 +266,15 @@ jobs:
           channel: "stable"
           cache: true
 
-      # ==========================================================
-      # 🔍 TAHAP ANALYZE — STEP 1: Jalankan & cetak hasil
-      # (Dipisah dari exit 1 biar log tidak ter-truncate)
-      # ==========================================================
-      - name: Analyze Project Code
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          echo "=== Starting Automated Code Analysis ==="
-
-          if [ -f "pubspec.yaml" ]; then
-            echo "🔍 Menjalankan linting via flutter analyze..."
-
-            flutter analyze > analyze_report.txt 2>&1 || true
-
-            echo "[RESULT_ANALYZE]"
-            cat analyze_report.txt
-            echo "[END_RESULT_ANALYZE]"
-
-            rm -f analyze_report.txt
-
-          else
-            echo "☕ Project native / gradlew terdeteksi!"
-            echo "[RESULT_ANALYZE]"
-            echo "❌ Fitur analyze hanya support project Flutter (pubspec.yaml tidak ditemukan)."
-            echo "[END_RESULT_ANALYZE]"
-          fi
-
-      # ==========================================================
-      # 🔍 TAHAP ANALYZE — STEP 2: Stop workflow jika only_analyze
-      # (Dipisah biar log step di atas sudah ter-commit ke GitHub)
-      # ==========================================================
-      - name: Stop if Analyze Only
-        if: ${{ github.event.inputs.only_analyze == 'true' }}
-        run: |
-          echo "Analyze-only mode aktif. Workflow dihentikan di sini."
-          exit 1
-
       # =========================
       # FLUTTER DOCTOR
       # =========================
       - name: Flutter Doctor
         run: flutter doctor
 
-      # ==========================================================
-      # 📦 TAHAP DOWNLOAD DEPENDENSI (PUB GET)
-      # ==========================================================
+      # =========================
+      # GET DEPENDENCIES
+      # =========================
       - name: Get dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
@@ -180,9 +285,9 @@ jobs:
             echo "☕ Bukan project Flutter standar, skip pub get!"
           fi
 
-      # ==========================================================
-      # 🚀 TAHAP PEMBAKARAN UTAMA (BUILD APK)
-      # ==========================================================
+      # =========================
+      # BUILD APK
+      # =========================
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
@@ -245,12 +350,12 @@ jobs:
           ls -lh "$APK_FOUND"
 
       # =========================
-      # UPLOAD APK
+      # 🔥 UPLOAD APK (DITAMBAHIN RUNNER ID BIAR UNIK)
       # =========================
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
+          name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}-runner${{ matrix.runner_id }}
           path: ${{ env.PROJECT_DIR }}/${{ env.APK_PATH }}
           retention-days: 1
           if-no-files-found: error
